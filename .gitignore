@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.part
+*.tdm.json
+
+# Local Claude Code state
+.claude/settings.local.json
+.claude
+docs
+tasks
+SESSION_GUIDE.md
+PROJECT.md
+CONSTRAINTS.md
+Document.md
+change.md
+CLAUDE.md
