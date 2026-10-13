@@ -16,7 +16,7 @@ import time
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import NamedTuple
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 import requests
 
@@ -27,6 +27,8 @@ SEGMENT_RETRIES = 5
 SAVE_INTERVAL = 1.0
 MAX_SEGMENTS = 32
 FREE_SLACK = 1 << 20  # 1 MiB headroom required beyond the download's own size
+_MAX_REDIRECTS = 10
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
 # One session shared by the probe and every segment request.
 # ponytail: plain Session, no mounted HTTPAdapter(pool_maxsize=MAX_SEGMENTS) yet.
@@ -125,6 +127,10 @@ class ProbeResult(NamedTuple):
     validator: str
     filename: str
     resolved_url: str
+    # The caller's forwarded headers as they stand at ``resolved_url``: a
+    # ``Cookie``/``Authorization`` meant for the start host is gone if the
+    # redirect chain left it. Segment/single requests must send *these*.
+    headers: dict[str, str] | None = None
 
 
 def _probe(url: str, headers: dict[str, str] | None = None) -> ProbeResult:
@@ -139,26 +145,44 @@ def _probe(url: str, headers: dict[str, str] | None = None) -> ProbeResult:
     (e.g. a forwarded ``Cookie``), is merged in - the probe's own ``Range``/
     ``Accept-Encoding`` always take precedence over a caller-supplied value
     for those two keys.
+
+    Redirects are followed by hand (up to ``_MAX_REDIRECTS``) so that
+    ``netcheck.assert_allowed_url`` vets *every* hop - the start URL and each
+    ``Location`` - before any request to it is made; a blocked intermediate hop
+    is never contacted. As ``requests`` itself would, ``Cookie`` and
+    ``Authorization`` are dropped once a redirect leaves the current hostname.
     """
-    r = _session.get(
-        url,
-        headers={**(headers or {}), "Range": "bytes=0-0", "Accept-Encoding": "identity"},
-        timeout=30,
-        allow_redirects=True,
-        stream=True,
-    )
-    try:
-        r.raise_for_status()
-        netcheck.assert_allowed_url(r.url)
-        accept_ranges = r.status_code == 206
-        content_range = r.headers.get("Content-Range", "")
-        total = content_range.rsplit("/", 1)[1] if "/" in content_range else ""
-        # `Content-Range: bytes 0-0/*` (unknown total) -> fall back to Content-Length.
-        size = int(total) if total.isdigit() else int(r.headers.get("Content-Length", 0))
-        validator = r.headers.get("ETag") or r.headers.get("Last-Modified") or ""
-        return ProbeResult(size, accept_ranges, validator, derive_filename(r.url, r), r.url)
-    finally:
-        r.close()
+    fwd = dict(headers or {})
+    hop = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        netcheck.assert_allowed_url(hop)
+        r = _session.get(
+            hop,
+            headers={**fwd, "Range": "bytes=0-0", "Accept-Encoding": "identity"},
+            timeout=30,
+            allow_redirects=False,
+            stream=True,
+        )
+        location = r.headers.get("Location")
+        if r.status_code in _REDIRECT_STATUSES and location:
+            r.close()
+            nxt = urljoin(hop, location)
+            if urlsplit(nxt).hostname != urlsplit(hop).hostname:
+                fwd = {k: v for k, v in fwd.items() if k.lower() not in ("cookie", "authorization")}
+            hop = nxt
+            continue
+        try:
+            r.raise_for_status()
+            accept_ranges = r.status_code == 206
+            content_range = r.headers.get("Content-Range", "")
+            total = content_range.rsplit("/", 1)[1] if "/" in content_range else ""
+            # `Content-Range: bytes 0-0/*` (unknown total) -> fall back to Content-Length.
+            size = int(total) if total.isdigit() else int(r.headers.get("Content-Length", 0))
+            validator = r.headers.get("ETag") or r.headers.get("Last-Modified") or ""
+            return ProbeResult(size, accept_ranges, validator, derive_filename(hop, r), hop, fwd)
+        finally:
+            r.close()
+    raise RuntimeError("too many redirects")
 
 
 # --- resume sidecar ---------------------------------------------------------
@@ -361,6 +385,10 @@ def _download_segment(
             ) as r:
                 if r.status_code == 200:
                     raise RangeNotSupported(resolved_url)
+                if 300 <= r.status_code < 400:  # redirect body on the resolved URL - not segment bytes
+                    raise RuntimeError(
+                        f"segment {idx}: unexpected {r.status_code} response - no body to save"
+                    )
                 r.raise_for_status()
                 if r.headers.get("Content-Encoding"):
                     raise RuntimeError(
@@ -545,7 +573,9 @@ def download(
     know the filename of a download that may later be paused (which never
     reaches a "done" callback) should use this instead. ``headers``, if given
     (e.g. a forwarded ``Cookie``), is merged into every request this download
-    makes - the probe's, every segment's, and the single-connection fallback's.
+    makes - the probe's, every segment's, and the single-connection fallback's -
+    except that ``Cookie``/``Authorization`` are withheld from any request to a
+    host the probe's redirect chain moved to (see ``_probe``).
     """
     segments = max(1, min(segments, MAX_SEGMENTS))
     dest = Path(dest_dir).resolve()
@@ -556,9 +586,12 @@ def download(
         raise ValueError("output path escapes dest_dir")
     if on_probed is not None:
         on_probed(probe.filename)
+    # Not `headers`: the probe already dropped Cookie/Authorization if the
+    # redirect chain left the start host, and the segments must not re-add them.
+    fwd = probe.headers
     if not probe.accept_ranges or probe.size <= 0:
         return _download_single(
-            probe.resolved_url, final, probe.size, progress_cb, cancel, segment_cb, headers
+            probe.resolved_url, final, probe.size, progress_cb, cancel, segment_cb, fwd
         )
     try:
         return _download_segmented(
@@ -570,11 +603,11 @@ def download(
             progress_cb,
             cancel,
             segment_cb,
-            headers,
+            fwd,
         )
     except RangeNotSupported:
         _part_path(final).unlink(missing_ok=True)
         _meta_path(final).unlink(missing_ok=True)
         return _download_single(
-            probe.resolved_url, final, probe.size, progress_cb, cancel, segment_cb, headers
+            probe.resolved_url, final, probe.size, progress_cb, cancel, segment_cb, fwd
         )

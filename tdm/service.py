@@ -27,7 +27,9 @@ import requests
 from tdm import __version__, engine, netcheck, paths
 from tdm.redact import redact, strip_credentials
 
-PERSIST_FIELDS = ("id", "url", "dest_dir", "segments", "state", "filename", "error")
+PERSIST_FIELDS = (
+    "id", "url", "dest_dir", "segments", "state", "filename", "error", "needs_headers",
+)
 _TERMINAL_STATES = {"done", "error", "cancelled"}
 _KEEP_TERMINAL = 50
 _NO_RETRY_EXCEPTIONS = (engine.InsufficientSpace, ValueError)  # ValueError covers BlockedURLError
@@ -49,6 +51,9 @@ class Download:
     done: int = 0
     bps: float = 0.0
     error: str | None = None
+    # Persisted flag only - the header *values* never reach disk. True means the
+    # download was queued with forwarded auth headers, which a restart loses.
+    needs_headers: bool = False
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     mode: str | None = field(default=None, repr=False)
     demoted: bool = field(default=False, repr=False)
@@ -88,7 +93,14 @@ class Manager:
             return
         for entry in data.get("downloads", []):
             try:
-                state = "queued" if entry["state"] in ("running", "paused") else entry["state"]
+                state = entry["state"]
+                needs_headers = bool(entry.get("needs_headers", False))
+                if needs_headers and state in ("running", "queued", "paused"):
+                    # forwarded cookies died with the old process: don't auto-run
+                    # header-less (it would 403); stay matchable by find_resumable
+                    state = "paused"
+                elif state in ("running", "paused"):
+                    state = "queued"
                 dl = Download(
                     id=entry["id"],
                     url=entry["url"],
@@ -97,6 +109,7 @@ class Manager:
                     state=state,
                     filename=entry.get("filename"),
                     error=entry.get("error"),
+                    needs_headers=needs_headers,
                 )
             except KeyError:
                 continue
@@ -117,6 +130,7 @@ class Manager:
             segments=segments,
             state="queued",
             headers=headers,
+            needs_headers=bool(headers),
         )
         with self._cond:
             self._downloads[dl.id] = dl
@@ -195,11 +209,20 @@ class Manager:
                 if dl.state in ("paused", "error") and self._url_key(dl.url) == key
             ]
 
-    def rebind(self, id: str, new_url: str, new_resolved_url: str, new_validator: str) -> None:
+    def rebind(
+        self,
+        id: str,
+        new_url: str,
+        new_resolved_url: str,
+        new_validator: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         """Point a paused/errored download at a fresh URL (same resource, a
         rotated signature) and requeue it. Rewrites the on-disk resume
         sidecar first via ``engine.rebind_progress`` so the requeued run
-        resumes from the existing bytes instead of restarting from zero."""
+        resumes from the existing bytes instead of restarting from zero.
+        ``headers`` replaces the download's forwarded headers outright - the
+        fresh link carries the current auth state, ``None`` means header-less."""
         with self._cond:
             dl = self._downloads.get(id)
             if dl is None or dl.state not in ("paused", "error"):
@@ -209,6 +232,8 @@ class Manager:
             final = Path(dl.dest_dir).resolve() / dl.filename
             engine.rebind_progress(final, new_resolved_url, new_validator)
             dl.url = new_url
+            dl.headers = headers
+            dl.needs_headers = bool(headers)
             dl.state = "queued"
             dl.demoted = False
             dl.error = None
@@ -531,8 +556,10 @@ class _Handler(BaseHTTPRequestHandler):
         if manager.snapshot_one(id_) is None:
             self._send_json(404, {"error": "not found"})
             return
-        getattr(manager, action)(id_)
-        self._send_json(202, {"ok": True})
+        if getattr(manager, action)(id_):
+            self._send_json(202, {"ok": True})
+        else:
+            self._send_json(409, {"error": "invalid state"})
 
     @staticmethod
     def _shutdown(server: "_Server") -> None:
@@ -825,7 +852,7 @@ def _try_resume(manager: Manager, url: str, headers: dict[str, str] | None) -> s
           f"({match.done}/{match.total} bytes done).")
     if input("  resume with this link? [y/n] ").strip().lower() != "y":
         return False
-    manager.rebind(match.id, url, probe.resolved_url, probe.validator)
+    manager.rebind(match.id, url, probe.resolved_url, probe.validator, headers)
     return match.id
 
 

@@ -85,6 +85,20 @@ def test_status_renders(monkeypatch, capsys):
     assert "def" in out and "queued" in out
 
 
+def test_action_maps_409_to_not_allowed_message(monkeypatch, capsys):
+    monkeypatch.setattr(client, "request", lambda method, path, body=None: (409, {"error": "x"}))
+    rc = main(["pause", "abc"])
+    assert rc == 1
+    assert "not allowed in the download's current state" in capsys.readouterr().out
+
+
+def test_action_maps_404_to_not_found(monkeypatch, capsys):
+    monkeypatch.setattr(client, "request", lambda method, path, body=None: (404, {"error": "x"}))
+    rc = main(["resume", "abc"])
+    assert rc == 1
+    assert "not found" in capsys.readouterr().out
+
+
 def test_cancel_wiring(monkeypatch, capsys):
     calls = []
 

@@ -24,9 +24,15 @@ no streaming-media extractor. Concretely, it cannot download from:
   your browser", hCaptcha/reCAPTCHA) — TDM makes a plain HTTP request with
   no JS execution or CAPTCHA solving, so it receives the challenge page
   (or a block response) instead of the file.
-- **Authenticated/session-gated downloads** — no cookie jar, no login flow,
-  no OAuth. A URL that only works inside an active browser session
-  (private Drive/Dropbox files, paywalled downloads) fails outside one.
+- **Authenticated/session-gated downloads (outside catch mode)** — no cookie
+  jar, no login flow, no OAuth. `python -m tdm <url>` and `tdm add <url>` send
+  no credentials, so a URL that only works inside an active browser session
+  (private Drive/Dropbox files, paywalled downloads) fails there. Catch mode
+  (`tdm catch` + the Chrome extension) is the exception: it forwards that
+  tab's `Cookie`, `Referer` and `User-Agent` for that one download. Those
+  headers are kept in memory only, so after a service restart the download
+  is left `paused` and you re-click the link in Chrome to resume it with
+  fresh cookies. TDM still has no login flow of its own.
 - **Streaming/adaptive media** (YouTube, Twitch VODs, HLS `.m3u8` / DASH
   `.mpd` manifests) — the engine expects one URL with a
   `Content-Length`/`Range`-capable response; these are a manifest plus many

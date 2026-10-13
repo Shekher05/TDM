@@ -95,6 +95,36 @@ def test_manager_error_state_never_leaks_forwarded_headers(tmp_path):
         mgr.shutdown()
 
 
+def test_add_with_headers_persists_flag_but_never_the_values(tmp_path):
+    mgr = Manager(tmp_path / "queue.json", download_dir=tmp_path / "dl")
+    with_h = mgr.add("http://h/a", headers={"Cookie": "session=s3cr3t"})
+    without_h = mgr.add("http://h/b")
+    text = (tmp_path / "queue.json").read_text()
+    assert "s3cr3t" not in text
+    by_id = {e["id"]: e for e in json.loads(text)["downloads"]}
+    assert by_id[with_h]["needs_headers"] is True
+    assert by_id[without_h]["needs_headers"] is False
+
+
+def test_rebind_replaces_headers(tmp_path, monkeypatch):
+    monkeypatch.setattr("tdm.engine.rebind_progress", lambda *a, **k: None)
+    mgr = Manager(tmp_path / "queue.json", download_dir=tmp_path / "dl")
+    id_ = mgr.add("http://h/f", headers={"Cookie": "session=old"})
+    dl = mgr._downloads[id_]
+    dl.filename = "f.bin"  # rebind needs it to locate the sidecar
+    assert mgr.pause(id_)  # queued -> paused, no scheduler needed
+
+    mgr.rebind(id_, "http://h/f?sig=1", "http://h/f?sig=1", '"e"', {"Cookie": "session=new"})
+    assert dl.headers == {"Cookie": "session=new"}
+    assert dl.needs_headers is True
+    assert dl.state == "queued"
+
+    assert mgr.pause(id_)
+    mgr.rebind(id_, "http://h/f?sig=2", "http://h/f?sig=2", '"e"')  # no headers: replaced, not kept
+    assert dl.headers is None
+    assert dl.needs_headers is False
+
+
 def test_ext_flag_queues_url_and_headers_as_tuple(ext_http):
     _mgr, base, pending = ext_http
     r = requests.post(
@@ -461,6 +491,47 @@ def test_restart_converts_running_and_paused_to_queued(tmp_path):
     assert mgr.snapshot_one("p1")["state"] == "queued"
 
 
+def test_restart_pauses_needs_headers_entries_and_does_not_auto_run(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("a needs_headers entry must not auto-run without its cookies")
+
+    monkeypatch.setattr("tdm.engine.download", boom)
+    state_path = tmp_path / "queue.json"
+    base = {"url": "http://h/f", "dest_dir": ".", "segments": 8, "filename": "f.bin",
+            "error": None, "needs_headers": True}
+    _write_queue(state_path, [
+        {**base, "id": "r1", "state": "running"},
+        {**base, "id": "q1", "state": "queued"},
+        {**base, "id": "p1", "state": "paused"},
+        {**base, "id": "d1", "state": "done"},
+    ])
+    mgr = Manager(state_path)
+    assert [mgr.snapshot_one(i)["state"] for i in ("r1", "q1", "p1", "d1")] == [
+        "paused", "paused", "paused", "done",
+    ]
+    mgr.start()
+    try:
+        time.sleep(0.2)  # scheduler must leave them alone
+        assert mgr.snapshot_one("q1")["state"] == "paused"
+        # still a catch-mode resume candidate when the user re-clicks the link
+        assert {d.id for d in mgr.find_resumable("http://h/f?sig=fresh")} == {"r1", "q1", "p1"}
+    finally:
+        mgr.shutdown()
+
+
+def test_restart_without_needs_headers_still_requeues(tmp_path):
+    state_path = tmp_path / "queue.json"
+    base = {"url": "http://h/f", "dest_dir": ".", "segments": 8, "filename": None, "error": None}
+    _write_queue(state_path, [
+        {**base, "id": "legacy", "state": "running"},  # pre-flag queue.json: key absent
+        {**base, "id": "explicit", "state": "paused", "needs_headers": False},
+        {**base, "id": "queued", "state": "queued"},
+    ])
+    mgr = Manager(state_path)
+    for id_ in ("legacy", "explicit", "queued"):
+        assert mgr.snapshot_one(id_)["state"] == "queued"
+
+
 def test_restart_keeps_done_entries(tmp_path, monkeypatch):
     def boom(*a, **k):
         raise AssertionError("engine.download should not run for a done entry")
@@ -629,7 +700,10 @@ def test_pause_resume_cancel_over_http(http, make_server):
 
     _poll(mgr, id_, {"running", "paused", "done", "error"}, timeout=5)
     r = requests.post(f"{base}/downloads/{id_}/pause", headers=_auth(), timeout=5)
-    assert r.status_code == 202
+    if r.status_code == 409:  # raced the download to completion - refused, not paused
+        assert mgr.snapshot_one(id_)["state"] == "done"
+    else:
+        assert r.status_code == 202
     snap = _poll(mgr, id_, {"paused", "done"}, timeout=10)
     if snap["state"] == "paused":
         r = requests.post(f"{base}/downloads/{id_}/resume", headers=_auth(), timeout=5)
@@ -640,11 +714,28 @@ def test_pause_resume_cancel_over_http(http, make_server):
     r = requests.post(base + "/downloads", json={"url": server.url}, headers=_auth(), timeout=5)
     id2 = r.json()["id"]
     r = requests.post(f"{base}/downloads/{id2}/cancel", headers=_auth(), timeout=5)
-    assert r.status_code == 202
+    if r.status_code == 409:  # same race as pause above
+        assert mgr.snapshot_one(id2)["state"] == "done"
+    else:
+        assert r.status_code == 202
     snap = _poll(mgr, id2, {"cancelled", "done"}, timeout=15)
 
     r = requests.post(f"{base}/downloads/nope/pause", headers=_auth(), timeout=5)
     assert r.status_code == 404
+
+
+@pytest.mark.parametrize("action", ["pause", "resume", "cancel"])
+def test_action_on_a_done_download_is_409(http, make_server, action):
+    mgr, base = http
+    server = make_server(os.urandom(1024))
+    r = requests.post(base + "/downloads", json={"url": server.url}, headers=_auth(), timeout=5)
+    id_ = r.json()["id"]
+    assert _poll(mgr, id_, {"done", "error"}, timeout=10)["state"] == "done"
+
+    r = requests.post(f"{base}/downloads/{id_}/{action}", headers=_auth(), timeout=5)
+    assert r.status_code == 409
+    assert r.json() == {"error": "invalid state"}
+    assert mgr.snapshot_one(id_)["state"] == "done"  # untouched
 
 
 def test_full_flow_add_poll_done_over_http(http, make_server):
@@ -913,6 +1004,36 @@ def test_confirm_loop_resumes_matching_paused_download(tmp_path, make_server, mo
         assert snap["state"] == "done"
         assert (dl_dir / snap["filename"]).read_bytes() == blob
         assert server.served_bytes < len(blob)  # resumed, not re-downloaded from scratch
+    finally:
+        mgr.shutdown()
+
+
+def test_confirm_loop_resume_applies_fresh_headers(tmp_path, make_server, monkeypatch):
+    """The fresh link's cookies replace whatever the paused download had (here
+    none, as after a service restart) - they must not be probe-only."""
+    blob = os.urandom(4 * 1024 * 1024)
+    server = make_server(blob)
+    dl_dir = tmp_path / "dl"
+    mgr = Manager(tmp_path / "queue.json", download_dir=dl_dir)
+    id_ = mgr.add(server.url)  # no headers, like a download revived after a restart
+    _wrap_cb_with_trigger(monkeypatch, mgr, lambda m, i: m.pause(i))
+
+    mgr.start()
+    try:
+        _poll(mgr, id_, {"paused"})
+
+        fresh = {"Cookie": "session=fresh"}
+        pending = queue.Queue()
+        pending.put((server.url + "?sig=fresh", fresh))
+        pending.put(None)
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
+        service._confirm_loop(mgr, pending)
+
+        assert mgr._downloads[id_].headers == fresh
+        assert mgr._downloads[id_].needs_headers is True
+        snap = _poll(mgr, id_, {"done", "error"}, timeout=15)
+        assert snap["state"] == "done"
+        assert (dl_dir / snap["filename"]).read_bytes() == blob
     finally:
         mgr.shutdown()
 

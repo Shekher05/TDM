@@ -318,40 +318,206 @@ def test_forwarded_headers_do_not_leak_into_connection_errors():
     assert secret not in str(exc_info.value)
 
 
+class _Hop:
+    """Throwaway stand-in for one `requests` response in a redirect chain."""
+
+    def __init__(self, url, status=200, headers=None):
+        self.url, self.status_code, self.headers = url, status, headers or {}
+
+    def raise_for_status(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _stub_hops(monkeypatch, hops):
+    """Make `_session.get` answer from `{url: _Hop}`; returns the call log of
+    `(url, headers)`. An unscripted URL raises KeyError - a request that should
+    never have been made fails loudly."""
+    calls = []
+
+    def fake_get(url, headers=None, **_kw):
+        calls.append((url, headers))
+        return hops[url]
+
+    monkeypatch.setattr("tdm.engine._session.get", fake_get)
+    return calls
+
+
+_PUBLIC = "http://93.184.216.34"  # public IP literal: the real guard needs no DNS
+_OK = {"Content-Range": "bytes 0-0/10", "ETag": '"e"'}
+
+
 def test_probe_rejects_non_http_redirect(monkeypatch):
-    class _FtpResp:
-        url = "ftp://evil/data"
-        status_code = 200
-        headers = {}  # noqa: RUF012 - throwaway stub, never mutated
-
-        def raise_for_status(self):
-            pass
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr("tdm.engine._session.get", lambda *a, **k: _FtpResp())
+    calls = _stub_hops(
+        monkeypatch,
+        {f"{_PUBLIC}/redirect-away": _Hop(f"{_PUBLIC}/redirect-away", 302, {"Location": "ftp://evil/data"})},
+    )
     monkeypatch.setattr(netcheck, "assert_allowed_url", _real_assert_allowed_url)
     with pytest.raises(ValueError, match="non-http"):
-        _probe("http://start/redirect-away")
+        _probe(f"{_PUBLIC}/redirect-away")
+    assert [u for u, _ in calls] == [f"{_PUBLIC}/redirect-away"]  # ftp hop never requested
 
 
 def test_probe_rejects_private_redirect(monkeypatch):
-    class _PrivateResp:
-        url = "http://127.0.0.1:9/evil"
-        status_code = 200
-        headers = {}  # noqa: RUF012 - throwaway stub, never mutated
-
-        def raise_for_status(self):
-            pass
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr("tdm.engine._session.get", lambda *a, **k: _PrivateResp())
+    calls = _stub_hops(
+        monkeypatch,
+        {
+            f"{_PUBLIC}/redirect-away": _Hop(
+                f"{_PUBLIC}/redirect-away", 302, {"Location": "http://127.0.0.1:9/evil"}
+            )
+        },
+    )
     monkeypatch.setattr(netcheck, "assert_allowed_url", _real_assert_allowed_url)
     with pytest.raises(BlockedURLError):
-        _probe("http://start/redirect-away")
+        _probe(f"{_PUBLIC}/redirect-away")
+    assert [u for u, _ in calls] == [f"{_PUBLIC}/redirect-away"]  # loopback hop never requested
+
+
+def test_probe_follows_same_host_redirect_and_resolves_final_url(monkeypatch):
+    calls = _stub_hops(
+        monkeypatch,
+        {
+            f"{_PUBLIC}/a": _Hop(f"{_PUBLIC}/a", 302, {"Location": "/b/file.zip"}),
+            f"{_PUBLIC}/b/file.zip": _Hop(f"{_PUBLIC}/b/file.zip", 206, _OK),
+        },
+    )
+    r = _probe(f"{_PUBLIC}/a")
+    assert r.resolved_url == f"{_PUBLIC}/b/file.zip"
+    assert r.filename == "file.zip"
+    assert (r.size, r.accept_ranges, r.validator) == (10, True, '"e"')
+    assert len(calls) == 2
+
+
+def test_probe_keeps_cookie_same_host_drops_it_cross_host(monkeypatch):
+    other = "http://93.184.216.35"
+    calls = _stub_hops(
+        monkeypatch,
+        {
+            f"{_PUBLIC}/a": _Hop(f"{_PUBLIC}/a", 302, {"Location": "/b"}),  # same host
+            f"{_PUBLIC}/b": _Hop(f"{_PUBLIC}/b", 307, {"Location": f"{other}/c"}),  # cross host
+            f"{other}/c": _Hop(f"{other}/c", 206, _OK),
+        },
+    )
+    secrets_ = {"Cookie": "session=abc", "authorization": "Bearer t", "X-Keep": "1"}
+    r = _probe(f"{_PUBLIC}/a", headers=secrets_)
+    assert r.resolved_url == f"{other}/c"
+    by_url = dict(calls)
+    assert by_url[f"{_PUBLIC}/a"]["Cookie"] == "session=abc"
+    assert by_url[f"{_PUBLIC}/b"]["Cookie"] == "session=abc"  # same-host hop keeps it
+    last = by_url[f"{other}/c"]
+    assert "Cookie" not in last and "authorization" not in last  # dropped on leaving the host
+    assert last["X-Keep"] == "1"
+    assert last["Range"] == "bytes=0-0" and last["Accept-Encoding"] == "identity"
+
+
+def test_probe_redirect_loop_raises(monkeypatch):
+    loop = f"{_PUBLIC}/loop"
+    calls = _stub_hops(monkeypatch, {loop: _Hop(loop, 302, {"Location": loop})})
+    with pytest.raises(RuntimeError, match="too many redirects"):
+        _probe(loop)
+    assert len(calls) == engine._MAX_REDIRECTS + 1
+
+
+def test_probe_reports_headers_as_they_stand_at_the_final_host(monkeypatch):
+    other = "http://93.184.216.35"
+    _stub_hops(
+        monkeypatch,
+        {
+            f"{_PUBLIC}/a": _Hop(f"{_PUBLIC}/a", 302, {"Location": f"{other}/c"}),
+            f"{other}/c": _Hop(f"{other}/c", 206, _OK),
+            f"{_PUBLIC}/same": _Hop(f"{_PUBLIC}/same", 206, _OK),
+        },
+    )
+    sent = {"Cookie": "session=abc", "authorization": "Bearer t", "X-Keep": "1"}
+    assert _probe(f"{_PUBLIC}/a", headers=sent).headers == {"X-Keep": "1"}
+    assert _probe(f"{_PUBLIC}/same", headers=sent).headers == sent  # no host change, no drop
+    assert _probe(f"{_PUBLIC}/same").headers == {}
+
+
+def _record_transfer_headers(monkeypatch, seen):
+    """Replace both transfer paths with a recorder of the `headers` they were
+    handed (it is the last positional argument of each)."""
+
+    def _rec(*a, **_kw):
+        seen.append(a[-1])
+        return Path("recorded")
+
+    monkeypatch.setattr(engine, "_download_segmented", _rec)
+    monkeypatch.setattr(engine, "_download_single", _rec)
+
+
+@pytest.mark.parametrize(
+    "final_status,final_headers",
+    [(206, _OK), (200, {"Content-Length": "10"})],  # segmented path, single-connection path
+    ids=["segmented", "single"],
+)
+def test_download_withholds_cookie_from_a_redirect_target(
+    monkeypatch, tmp_path, final_status, final_headers
+):
+    other = "http://93.184.216.35"
+    _stub_hops(
+        monkeypatch,
+        {
+            f"{_PUBLIC}/a": _Hop(f"{_PUBLIC}/a", 302, {"Location": f"{other}/c"}),
+            f"{other}/c": _Hop(f"{other}/c", final_status, final_headers),
+        },
+    )
+    seen = []
+    _record_transfer_headers(monkeypatch, seen)
+    download(
+        f"{_PUBLIC}/a", tmp_path, headers={"Cookie": "session=abc", "X-Keep": "1"}
+    )
+    assert seen == [{"X-Keep": "1"}]  # the start host's Cookie never reaches the CDN
+
+
+def test_download_keeps_cookie_when_redirect_stays_on_the_host(monkeypatch, tmp_path):
+    _stub_hops(
+        monkeypatch,
+        {
+            f"{_PUBLIC}/a": _Hop(f"{_PUBLIC}/a", 302, {"Location": "/b"}),
+            f"{_PUBLIC}/b": _Hop(f"{_PUBLIC}/b", 206, _OK),
+        },
+    )
+    seen = []
+    _record_transfer_headers(monkeypatch, seen)
+    download(f"{_PUBLIC}/a", tmp_path, headers={"Cookie": "session=abc"})
+    assert seen == [{"Cookie": "session=abc"}]
+
+
+def test_segment_rejects_a_redirect_response_without_writing_it(monkeypatch, tmp_path):
+    calls = []
+
+    class _Resp:
+        status_code = 302
+        headers = {"Location": "http://elsewhere/f"}  # noqa: RUF012
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def raise_for_status(self):
+            pass  # requests does not raise for 3xx
+
+        def iter_content(self, n):
+            yield b"<html>redirect page</html>"
+
+    def fake_get(*a, **k):
+        calls.append(1)
+        return _Resp()
+
+    monkeypatch.setattr("tdm.engine._session.get", fake_get)
+    part = tmp_path / "f.part"
+    part.write_bytes(b"\x00" * 11)
+    progress = [0]
+    with pytest.raises(RuntimeError, match="302"):
+        engine._download_segment("http://h/f", part, 0, 10, progress, 0)
+    assert len(calls) == 1  # not retried
+    assert progress == [0]
+    assert part.read_bytes() == b"\x00" * 11  # the redirect body never hit the file
 
 
 # --- _download_segmented (Task 5) ----------------------------------------

@@ -94,6 +94,9 @@ def _cmd_action(cmd: str, rest: list[str]) -> int:
     if status == 202:
         print("ok")
         return 0
+    if status == 409:
+        print("not allowed in the download's current state")
+        return 1
     print("not found")
     return 1
 
