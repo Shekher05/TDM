@@ -332,16 +332,16 @@ class _Hop:
 
 
 def _stub_hops(monkeypatch, hops):
-    """Make `_session.get` answer from `{url: _Hop}`; returns the call log of
+    """Make `requests.Session.get` answer from `{url: _Hop}`; returns the call log of
     `(url, headers)`. An unscripted URL raises KeyError - a request that should
     never have been made fails loudly."""
     calls = []
 
-    def fake_get(url, headers=None, **_kw):
+    def fake_get(_self, url, headers=None, **_kw):
         calls.append((url, headers))
         return hops[url]
 
-    monkeypatch.setattr("tdm.engine._session.get", fake_get)
+    monkeypatch.setattr(requests.Session, "get", fake_get)
     return calls
 
 
@@ -412,12 +412,50 @@ def test_probe_keeps_cookie_same_host_drops_it_cross_host(monkeypatch):
     assert last["Range"] == "bytes=0-0" and last["Accept-Encoding"] == "identity"
 
 
+def test_probe_keeps_cookie_across_drive_to_usercontent(monkeypatch):
+    calls = _stub_hops(
+        monkeypatch,
+        {
+            "http://drive.google.com/a": _Hop("http://drive.google.com/a", 302, {"Location": "http://drive.usercontent.google.com/c"}),
+            "http://drive.usercontent.google.com/c": _Hop("http://drive.usercontent.google.com/c", 206, _OK),
+        },
+    )
+    secrets_ = {"Cookie": "download_warning=abc"}
+    r = _probe("http://drive.google.com/a", headers=secrets_)
+    assert r.resolved_url == "http://drive.usercontent.google.com/c"
+    by_url = dict(calls)
+    assert by_url["http://drive.usercontent.google.com/c"]["Cookie"] == "download_warning=abc"
+
+
+@pytest.mark.parametrize(
+    "start,dest",
+    [
+        ("bank.co.uk", "attacker.co.uk"),  # shared public suffix, unrelated sites
+        ("google.com", "evilgoogle.com"),  # unbounded endswith
+        ("foo.example.com", "bar.example.com"),  # no suffix matching: exact host or Drive only
+        ("drive.google.com", "evil.google.com"),
+    ],
+)
+def test_probe_drops_cookie_to_look_alike_host(monkeypatch, start, dest):
+    calls = _stub_hops(
+        monkeypatch,
+        {
+            f"http://{start}/a": _Hop(f"http://{start}/a", 302, {"Location": f"http://{dest}/c"}),
+            f"http://{dest}/c": _Hop(f"http://{dest}/c", 206, _OK),
+        },
+    )
+    r = _probe(f"http://{start}/a", headers={"Cookie": "s=1", "Authorization": "Bearer t"})
+    last = dict(calls)[f"http://{dest}/c"]
+    assert "Cookie" not in last and "Authorization" not in last
+    assert r.headers == {}
+
+
 def test_probe_redirect_loop_raises(monkeypatch):
     loop = f"{_PUBLIC}/loop"
     calls = _stub_hops(monkeypatch, {loop: _Hop(loop, 302, {"Location": loop})})
-    with pytest.raises(RuntimeError, match="too many redirects"):
+    with pytest.raises(RuntimeError, match="redirect loop detected"):
         _probe(loop)
-    assert len(calls) == engine._MAX_REDIRECTS + 1
+    assert len(calls) == 1
 
 
 def test_probe_reports_headers_as_they_stand_at_the_final_host(monkeypatch):
@@ -509,7 +547,7 @@ def test_segment_rejects_a_redirect_response_without_writing_it(monkeypatch, tmp
         calls.append(1)
         return _Resp()
 
-    monkeypatch.setattr("tdm.engine._session.get", fake_get)
+    monkeypatch.setattr(requests.Session, "get", lambda _self, *a, **k: fake_get(*a, **k))
     part = tmp_path / "f.part"
     part.write_bytes(b"\x00" * 11)
     progress = [0]
@@ -755,7 +793,7 @@ def test_probe_survives_unknown_content_range_total(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr("tdm.engine._session.get", lambda *a, **k: _Resp())
+    monkeypatch.setattr(requests.Session, "get", lambda *a, **k: _Resp())
     assert _probe("http://h/f.bin").size == 0  # no crash on int("*")
 
 
@@ -776,7 +814,7 @@ def test_download_single_rejects_a_truncated_stream(monkeypatch, tmp_path):
         def iter_content(self, n):
             yield b"only a few bytes"
 
-    monkeypatch.setattr("tdm.engine._session.get", lambda *a, **k: _Resp())
+    monkeypatch.setattr(requests.Session, "get", lambda *a, **k: _Resp())
     final = tmp_path / "f.bin"
     with pytest.raises(IntegrityError):
         _download_single("http://h/f.bin", final, 1_000_000, None)
@@ -806,7 +844,7 @@ def test_segment_does_not_retry_client_errors(monkeypatch, tmp_path):
         calls.append(1)
         return _Resp()
 
-    monkeypatch.setattr("tdm.engine._session.get", fake_get)
+    monkeypatch.setattr(requests.Session, "get", lambda _self, *a, **k: fake_get(*a, **k))
     part = tmp_path / "f.part"
     part.write_bytes(b"\x00" * 11)
     with pytest.raises(requests.HTTPError):
@@ -949,3 +987,46 @@ def test_output_path_escape_rejected(make_server, tmp_path):
         pytest.skip("symlink creation not permitted on this platform")
     with pytest.raises(ValueError, match="escapes"):
         download(server.url, dest_dir=dest)
+
+
+def test_download_does_not_reuse_cookies_between_downloads(monkeypatch, tmp_path):
+    sent = []
+
+    class _Resp:
+        status_code = 206
+        headers = {"Content-Range": "bytes 0-0/1", "Set-Cookie": "leak=1"}  # noqa: RUF012
+
+        def raise_for_status(self):
+            pass
+
+        def close(self):
+            pass
+
+    def fake_send(self, request, **_kw):
+        sent.append(request.headers.get("Cookie"))
+        self.cookies.set("leak", "1")  # as requests would after a Set-Cookie response
+        return _Resp()
+
+    monkeypatch.setattr(requests.Session, "send", fake_send)
+    monkeypatch.setattr(engine, "_download_segmented", lambda *a, **k: Path("x"))
+    monkeypatch.setattr(engine, "_download_single", lambda *a, **k: Path("x"))
+    download("http://h/f.bin", tmp_path)
+    download("http://h/f.bin", tmp_path)
+    assert sent == [None, None]  # the first download's cookie is not sent on the second
+
+
+def test_drive_403_gets_fresh_link_hint_and_keeps_status():
+    class _R:
+        status_code = 403
+        url = "https://drive.usercontent.google.com/download?id=x"
+
+        def raise_for_status(self):
+            raise requests.HTTPError("403 Client Error", response=self)
+
+    with pytest.raises(requests.HTTPError, match="tdm catch") as ei:
+        engine._raise_for_status(_R())
+    assert ei.value.response.status_code == 403
+    _R.url = "https://example.com/f"
+    with pytest.raises(requests.HTTPError) as ei:
+        engine._raise_for_status(_R())
+    assert "tdm catch" not in str(ei.value)

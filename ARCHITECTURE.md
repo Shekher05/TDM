@@ -5,7 +5,7 @@
 > open the specific module you need. Written from a full read of every source,
 > test, and doc file in the repo (version `0.1.0`).
 >
-> **Snapshot:** 2026-10-13, on top of commit `11a9715`; `pytest` = 184 passed,
+> **Snapshot:** 2026-10-13, branch `gm1` on top of commit `11a9715`; `pytest` = 187 passed,
 > 1 skipped (symlink privilege), `ruff check .` clean. Read sections 12-13
 > before changing code. **Not captured here:** the design *rationale* in the
 > gitignored planning docs (`PROJECT.md`, `CONSTRAINTS.md`,
@@ -125,16 +125,18 @@ Flow inside `download()`:
    `Accept-Encoding: identity`. Returns `ProbeResult(size, accept_ranges,
    validator, filename, resolved_url)`.
    - **Redirects are followed by hand** (`allow_redirects=False`, max
-     `_MAX_REDIRECTS=10`, else `RuntimeError("too many redirects")`).
+     `_MAX_REDIRECTS=20`, else `RuntimeError("too many redirects")`).
      `netcheck.assert_allowed_url` vets **every hop** (start URL and each
      `Location`) *before* it is requested, so a blocked hop is never contacted.
-     `Cookie`/`Authorization` are dropped once a redirect changes hostname.
+     `Cookie`/`Authorization` are dropped via `_should_drop_auth` whenever the
+     redirect leaves the exact hostname, except between `drive.google.com` and
+     `drive.usercontent.google.com` (`_DRIVE_HOSTS`). No suffix matching.
    - `accept_ranges = (status == 206)`; size from `Content-Range: .../<total>`,
      falling back to `Content-Length`.
    - `validator = ETag or Last-Modified or ""`.
    - `resolved_url` is the final hop URL; `ProbeResult.headers` is the caller's
-     forwarded headers *as they stand at that host* (Cookie/Authorization already
-     dropped if the chain left the start host). `download()` hands **these**, not
+     forwarded headers *as they stand at that host* (Cookie/Authorization dropped
+     only if the chain left the exact host / Drive pair). `download()` hands **these**, not
      the original `headers`, to the segment/single transfer paths.
    - Filename via `derive_filename` (Content-Disposition → URL path → `download.bin`),
      sanitized: basename only, NTFS `:` ADS suffix dropped, control chars and
@@ -194,9 +196,12 @@ names; `_emit` computes speed as the slope between consecutive callbacks.
 **Exceptions:** `RangeNotSupported`, `IntegrityError`, `Cancelled`,
 `InsufficientSpace`, internal `_ShortRead`.
 
-**Module-level session:** a single shared `requests.Session` with a Chrome-like
-User-Agent/Accept headers (helps vs. naive UA filtering only; does not defeat TLS
-fingerprinting).
+**Per-download session:** `download()` makes a fresh `requests.Session`
+(`_new_session()`, Chrome-like User-Agent/Accept headers - helps vs. naive UA
+filtering only; does not defeat TLS fingerprinting) and passes it to the probe and
+every segment, so cookies never carry over to another download. A 401/403 from a
+Drive host (`_raise_for_status`) keeps its status and adds a "run `tdm catch`,
+click Download again" hint.
 
 ### 4.2 `tdm/service.py` — queue, HTTP API, catch mode, process management
 
@@ -340,11 +345,13 @@ passed through `redact()`.
 
 `background.js` listens on `chrome.downloads.onCreated`. For `http(s)` URLs:
 (1) `POST /ext/health` (400 ms timeout) to confirm TDM catch is running and fetch
-`ext_token`; (2) gather `Cookie` (via `chrome.cookies.getAll`), `Referer`, `User-Agent`;
-(3) `POST /ext/flag`; (4) only if `202`, cancel and erase Chrome's own download.
+`ext_token`; (2) gather `Cookie` (via `chrome.cookies.getAll({url: item.url})` only, so Chrome's own
+scope rules apply and duplicate names are kept), `Referer`,
+`User-Agent`; (3) `POST /ext/flag`; (4) only if `202`, cancel and erase Chrome's own download.
 **Any failure → return silently** so Chrome's normal download proceeds (fail-open).
-Hard-coded `BASE = http://127.0.0.1:8765`. The extension id Chrome assigns must be
-registered with `python -m tdm catch --extension-id <id>`.
+Hard-coded `BASE = http://127.0.0.1:8765`. Manifest `host_permissions` allows
+`http://*/*` and `https://*/*` for reading site cookies. The extension id Chrome assigns
+must be registered with `python -m tdm catch --extension-id <id>`.
 
 ---
 
@@ -505,11 +512,11 @@ Manager tests drive pause/cancel deterministically by wrapping `Manager._cb`.
    later downloads from that host until the service restarts.
 3. **`POST /downloads` ignores any `headers` field**; forwarded headers are only
    reachable through catch mode.
-4. **Cookie scope is per-hostname, not per-registrable-domain.** A redirect from
-   `www.example.com` to `cdn.example.com` drops the forwarded `Cookie` even
-   though a browser would send a domain-wide cookie. If such a CDN host needs it,
-   the download will be refused rather than leak it; relaxing this means a
-   deliberate suffix-matching rule in `_probe`.
+4. **Cookie scope is exact-host plus the Drive pair.** Only a redirect that stays on
+   the same hostname, or moves between `drive.google.com` and
+   `drive.usercontent.google.com`, keeps forwarded `Cookie`/`Authorization` headers;
+   any other host (including sibling subdomains) drops them to prevent credential
+   leakage.
 5. `limitations.md` was corrected: "no cookie jar / session downloads" applies to
    `add`/one-shot use; catch mode forwards the tab's cookies for that download.
 6. `README.md` links to `docs/milestone-2-security.md`, which is gitignored and
@@ -547,8 +554,9 @@ weakens one needs an explicit decision, not a drive-by.
    sanitized basename (`derive_filename`).
 9. Forwarded headers (cookies) live in `Download.headers` (RAM) only: never in
    `queue.json`, snapshots, sidecars, or error strings. Only the boolean
-   `needs_headers` is persisted. `Cookie`/`Authorization` are never sent to a
-   host the probe's redirect chain moved to (segments use `ProbeResult.headers`).
+   `needs_headers` is persisted. `Cookie`/`Authorization` are never sent to an
+   host other than the original or the Drive pair (segments use
+   `ProbeResult.headers`).
 10. Anything persisted goes through `strip_credentials`; anything user-facing
     goes through `redact`.
 11. The service binds `127.0.0.1` only (no `--host`); every non-`/ext/*` request

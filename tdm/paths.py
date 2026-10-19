@@ -45,6 +45,24 @@ def write_atomic(path: Path, text: str) -> None:
         pass
 
 
+def replace_atomic(src: Path, dst: Path, retries: int = 5) -> None:
+    """``os.replace`` with bounded retries on Windows ``PermissionError``.
+
+    On Windows, virus scanners (Windows Defender, etc.) or indexers can briefly
+    open a freshly finished file, or another thread/process can hold it open,
+    causing ``os.replace`` to raise ``PermissionError`` / ``[WinError 32]``.
+    A short backoff absorbs this race and completes the file promotion.
+    """
+    for attempt in range(retries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(0.05 * (2**attempt))
+
+
 def read_or_none(path: Path) -> str | None:
     try:
         return path.read_text()

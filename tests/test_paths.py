@@ -66,6 +66,38 @@ def test_write_atomic_gives_up_after_persistent_permission_error(tmp_path, monke
         write_atomic(tmp_path / "file.txt", "hello")
 
 
+def test_replace_atomic_retries_transient_permission_error(tmp_path, monkeypatch):
+    src = tmp_path / "src.bin"
+    dst = tmp_path / "dst.bin"
+    src.write_bytes(b"data")
+    calls = {"n": 0}
+    real_replace = paths_module.os.replace
+
+    def flaky_replace(s, d):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError("Access is denied")
+        return real_replace(s, d)
+
+    monkeypatch.setattr(paths_module.os, "replace", flaky_replace)
+    paths_module.replace_atomic(src, dst)
+    assert dst.read_bytes() == b"data"
+    assert calls["n"] == 3
+
+
+def test_replace_atomic_gives_up_after_persistent_permission_error(tmp_path, monkeypatch):
+    src = tmp_path / "src.bin"
+    dst = tmp_path / "dst.bin"
+    src.write_bytes(b"data")
+
+    def always_fails(s, d):
+        raise PermissionError("Access is denied")
+
+    monkeypatch.setattr(paths_module.os, "replace", always_fails)
+    with pytest.raises(PermissionError):
+        paths_module.replace_atomic(src, dst)
+
+
 def test_default_download_dir_not_created_on_import(tmp_path, monkeypatch):
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     d = default_download_dir()

@@ -33,6 +33,8 @@ chrome.downloads.onCreated.addListener(async (item) => {
 
   let forwardedHeaders;
   try {
+    // getAll({url}) applies Chrome's own scope rules (path, host-only, Secure, SameSite),
+    // in a deterministic order, and keeps duplicate names. No parent-domain widening.
     const cookies = await chrome.cookies.getAll({ url: item.url });
     const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
     forwardedHeaders = {

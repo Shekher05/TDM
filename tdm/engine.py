@@ -20,20 +20,15 @@ from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 import requests
 
-from tdm import netcheck
+from tdm import netcheck, paths
 
 CHUNK = 65536
 SEGMENT_RETRIES = 5
 SAVE_INTERVAL = 1.0
 MAX_SEGMENTS = 32
 FREE_SLACK = 1 << 20  # 1 MiB headroom required beyond the download's own size
-_MAX_REDIRECTS = 10
+_MAX_REDIRECTS = 20
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
-
-# One session shared by the probe and every segment request.
-# ponytail: plain Session, no mounted HTTPAdapter(pool_maxsize=MAX_SEGMENTS) yet.
-# Upgrade path: mount one only if 32 concurrent segments log "connection pool is full".
-_session = requests.Session()
 
 # A modern browser User-Agent/Accept set, replacing requests' identifying
 # default ("python-requests/x.y.z"). Helps only against naive User-Agent
@@ -49,7 +44,38 @@ _DEFAULT_HEADERS = {
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
 }
-_session.headers.update(_DEFAULT_HEADERS)
+
+# The only hosts that may hand a forwarded Cookie/Authorization to each other,
+# and the hosts whose 401/403 gets the "fresh link" hint.
+_DRIVE_HOSTS = {"drive.google.com", "drive.usercontent.google.com"}
+
+
+def _new_session() -> requests.Session:
+    """A fresh session (own cookie jar) for one ``download()``: a cookie set
+    during one download must never ride along on a later, unrelated one.
+
+    # ponytail: plain Session, no mounted HTTPAdapter(pool_maxsize=MAX_SEGMENTS) yet.
+    # Upgrade path: mount one only if 32 concurrent segments log "connection pool is full".
+    """
+    session = requests.Session()
+    session.headers.update(_DEFAULT_HEADERS)
+    return session
+
+
+def _raise_for_status(r) -> None:
+    """``r.raise_for_status()``, but a 401/403 from a Drive download host keeps
+    its status and gains a hint. Not every Drive 403 is expiry (permissions and
+    quota give the same status), so the hint only suggests."""
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as exc:
+        if r.status_code in (401, 403) and (urlsplit(r.url).hostname or "").lower() in _DRIVE_HOSTS:
+            raise requests.HTTPError(
+                f"{exc} - if this Drive link is stale, run `tdm catch` and click "
+                "Download again in Chrome for a fresh URL and session headers.",
+                response=r,
+            ) from exc
+        raise
 
 # Windows reserved device names: reserved regardless of extension, case-insensitive.
 _RESERVED_NAMES = {
@@ -133,7 +159,23 @@ class ProbeResult(NamedTuple):
     headers: dict[str, str] | None = None
 
 
-def _probe(url: str, headers: dict[str, str] | None = None) -> ProbeResult:
+def _should_drop_auth(host_a: str | None, host_b: str | None) -> bool:
+    """Return True if Cookie / Authorization should be dropped when redirecting
+    from host_a to host_b.
+
+    Keeps them only on an exact hostname match or for the Drive ->
+    usercontent transition (``_DRIVE_HOSTS``). No suffix matching: that cannot
+    tell ``bank.co.uk`` from ``attacker.co.uk`` or ``google.com`` from
+    ``evilgoogle.com``.
+    """
+    if not host_a or not host_b or host_a == host_b:
+        return False
+    return not ({host_a.lower(), host_b.lower()} <= _DRIVE_HOSTS)
+
+
+def _probe(
+    url: str, headers: dict[str, str] | None = None, session: requests.Session | None = None
+) -> ProbeResult:
     """One ranged ``GET`` (``bytes=0-0``) that doubles as the probe.
 
     Returns the total size, whether the server honours ``Range``, a strong
@@ -150,13 +192,21 @@ def _probe(url: str, headers: dict[str, str] | None = None) -> ProbeResult:
     ``netcheck.assert_allowed_url`` vets *every* hop - the start URL and each
     ``Location`` - before any request to it is made; a blocked intermediate hop
     is never contacted. As ``requests`` itself would, ``Cookie`` and
-    ``Authorization`` are dropped once a redirect leaves the current hostname.
+    ``Authorization`` are dropped once a redirect leaves the current hostname,
+    unless the destination is the same hostname or the Drive -> usercontent
+    transition (see ``_should_drop_auth``). ``session`` is the per-download
+    session (a fresh one if omitted).
     """
+    session = session or _new_session()
     fwd = dict(headers or {})
     hop = url
+    visited = set()
     for _ in range(_MAX_REDIRECTS + 1):
+        if hop in visited:
+            raise RuntimeError(f"redirect loop detected at {hop}")
+        visited.add(hop)
         netcheck.assert_allowed_url(hop)
-        r = _session.get(
+        r = session.get(
             hop,
             headers={**fwd, "Range": "bytes=0-0", "Accept-Encoding": "identity"},
             timeout=30,
@@ -165,14 +215,26 @@ def _probe(url: str, headers: dict[str, str] | None = None) -> ProbeResult:
         )
         location = r.headers.get("Location")
         if r.status_code in _REDIRECT_STATUSES and location:
+            # Capture any cookies set by intermediate redirect responses
+            set_cookies = r.headers.getlist("Set-Cookie") if hasattr(r.headers, "getlist") else []
+            if not set_cookies and "Set-Cookie" in r.headers:
+                set_cookies = [r.headers["Set-Cookie"]]
             r.close()
             nxt = urljoin(hop, location)
-            if urlsplit(nxt).hostname != urlsplit(hop).hostname:
+            if _should_drop_auth(urlsplit(hop).hostname, urlsplit(nxt).hostname):
                 fwd = {k: v for k, v in fwd.items() if k.lower() not in ("cookie", "authorization")}
+            elif set_cookies:
+                # Merge new cookie key=value into existing Cookie header
+                existing = fwd.get("Cookie", "")
+                cookie_parts = [p.strip() for p in existing.split(";") if p.strip()] if existing else []
+                new_pairs = [sc.split(";")[0].strip() for sc in set_cookies if sc.strip()]
+                combined = "; ".join(cookie_parts + new_pairs)
+                if combined:
+                    fwd["Cookie"] = combined
             hop = nxt
             continue
         try:
-            r.raise_for_status()
+            _raise_for_status(r)
             accept_ranges = r.status_code == 206
             content_range = r.headers.get("Content-Range", "")
             total = content_range.rsplit("/", 1)[1] if "/" in content_range else ""
@@ -182,7 +244,7 @@ def _probe(url: str, headers: dict[str, str] | None = None) -> ProbeResult:
             return ProbeResult(size, accept_ranges, validator, derive_filename(hop, r), hop, fwd)
         finally:
             r.close()
-    raise RuntimeError("too many redirects")
+    raise RuntimeError(f"too many redirects ({_MAX_REDIRECTS}+ hops), last hop: {hop}")
 
 
 # --- resume sidecar ---------------------------------------------------------
@@ -254,7 +316,7 @@ def _save_progress(meta: Path, url: str, size: int, etag: str, progress: list[in
     tmp.write_text(
         json.dumps({"url": _sidecar_url(url), "size": size, "etag": etag, "progress": progress})
     )
-    os.replace(tmp, meta)
+    paths.replace_atomic(tmp, meta)
 
 
 def rebind_progress(final: Path, new_url: str, new_validator: str) -> None:
@@ -357,6 +419,7 @@ def _download_segment(
     idx: int,
     cancel: threading.Event | None = None,
     headers: dict[str, str] | None = None,
+    session: requests.Session | None = None,
 ) -> None:
     """Fetch ``[start + progress[idx] .. end]`` into ``part`` at its true offset.
 
@@ -366,7 +429,9 @@ def _download_segment(
     the current offset; a ``200`` response raises ``RangeNotSupported``. A set
     ``cancel`` event raises ``Cancelled`` instead of retrying or writing further.
     ``headers``, if given, is merged in the same way as ``_probe``'s.
+    ``session`` is the download's shared session (a fresh one if omitted).
     """
+    session = session or _new_session()
     need = end - start + 1
     for attempt in range(SEGMENT_RETRIES):
         if cancel is not None and cancel.is_set():
@@ -376,7 +441,7 @@ def _download_segment(
         if pos > end:
             return
         try:
-            with _session.get(
+            with session.get(
                 resolved_url,
                 headers={**(headers or {}), "Range": f"bytes={pos}-{end}", "Accept-Encoding": "identity"},
                 stream=True,
@@ -389,7 +454,7 @@ def _download_segment(
                     raise RuntimeError(
                         f"segment {idx}: unexpected {r.status_code} response - no body to save"
                     )
-                r.raise_for_status()
+                _raise_for_status(r)
                 if r.headers.get("Content-Encoding"):
                     raise RuntimeError(
                         f"segment {idx}: unexpected Content-Encoding "
@@ -423,6 +488,7 @@ def _download_segmented(
     cancel: threading.Event | None = None,
     segment_cb=None,
     headers: dict[str, str] | None = None,
+    session: requests.Session | None = None,
 ) -> Path:
     """Download ``resolved_url`` into ``final`` using ``segments`` parallel ranges,
     resuming from a trusted sidecar if one is present. Promotes ``.part`` to
@@ -431,7 +497,8 @@ def _download_segmented(
     ``.part`` and the sidecar in place. ``segment_cb``, if given, is called with
     a ``[(done, total), ...]`` list (one entry per segment) on the same cadence
     as ``cb``, plus once more on completion. ``headers``, if given, is forwarded
-    to every segment request (see ``_probe``)."""
+    to every segment request (see ``_probe``); every segment shares ``session``."""
+    session = session or _new_session()
     part, meta = _part_path(final), _meta_path(final)
     _check_free_space(part, size)
     ranges = split_ranges(size, segments)
@@ -450,7 +517,7 @@ def _download_segmented(
     ex = ThreadPoolExecutor(max_workers=min(len(ranges), MAX_SEGMENTS))
     try:
         pending = {
-            ex.submit(_download_segment, resolved_url, part, s, e, progress, i, cancel, headers)
+            ex.submit(_download_segment, resolved_url, part, s, e, progress, i, cancel, headers, session)
             for i, (s, e) in enumerate(ranges)
             if progress[i] < e - s + 1
         }
@@ -480,7 +547,7 @@ def _download_segmented(
     _emit(cb, size, size, speed)
     if segment_cb is not None:
         segment_cb(list(zip(progress, totals, strict=True)))
-    os.replace(part, final)
+    paths.replace_atomic(part, final)
     meta.unlink(missing_ok=True)
     return final
 
@@ -493,6 +560,7 @@ def _download_single(
     cancel: threading.Event | None = None,
     segment_cb=None,
     headers: dict[str, str] | None = None,
+    session: requests.Session | None = None,
 ) -> Path:
     """One streamed ``GET`` into ``final``, always from zero - no resume.
 
@@ -505,18 +573,19 @@ def _download_single(
     special-case the fallback path. ``headers``, if given, is merged in the
     same way as ``_probe``'s.
     """
+    session = session or _new_session()
     part, meta = _part_path(final), _meta_path(final)
     _check_free_space(part, size)
     netcheck.assert_allowed_url(resolved_url)
     speed = [time.monotonic(), 0.0]
-    with _session.get(
+    with session.get(
         resolved_url,
         headers={**(headers or {}), "Accept-Encoding": "identity"},
         stream=True,
         timeout=30,
         allow_redirects=False,
     ) as r:
-        r.raise_for_status()
+        _raise_for_status(r)
         if r.status_code >= 300:  # redirect body on the already-resolved URL - not the file
             raise RuntimeError(f"unexpected {r.status_code} response - no body to save")
         if r.headers.get("Content-Encoding"):
@@ -543,7 +612,7 @@ def _download_single(
     _emit(cb, done, done, speed)
     if segment_cb is not None:
         segment_cb([(done, done)])
-    os.replace(part, final)
+    paths.replace_atomic(part, final)
     meta.unlink(missing_ok=True)
     return final
 
@@ -575,12 +644,14 @@ def download(
     (e.g. a forwarded ``Cookie``), is merged into every request this download
     makes - the probe's, every segment's, and the single-connection fallback's -
     except that ``Cookie``/``Authorization`` are withheld from any request to a
-    host the probe's redirect chain moved to (see ``_probe``).
+    host the probe's redirect chain moved to (see ``_probe``). Each call makes
+    its own ``requests.Session``, so cookies never leak between downloads.
     """
     segments = max(1, min(segments, MAX_SEGMENTS))
     dest = Path(dest_dir).resolve()
     dest.mkdir(parents=True, exist_ok=True)
-    probe = _probe(url, headers)
+    session = _new_session()  # this download's own cookie jar - never reused
+    probe = _probe(url, headers, session)
     final = dest / probe.filename
     if dest not in final.resolve().parents or dest not in _part_path(final).resolve().parents:
         raise ValueError("output path escapes dest_dir")
@@ -591,7 +662,8 @@ def download(
     fwd = probe.headers
     if not probe.accept_ranges or probe.size <= 0:
         return _download_single(
-            probe.resolved_url, final, probe.size, progress_cb, cancel, segment_cb, fwd
+            probe.resolved_url, final, probe.size, progress_cb, cancel, segment_cb, fwd,
+            session=session,
         )
     try:
         return _download_segmented(
@@ -604,10 +676,12 @@ def download(
             cancel,
             segment_cb,
             fwd,
+            session=session,
         )
     except RangeNotSupported:
         _part_path(final).unlink(missing_ok=True)
         _meta_path(final).unlink(missing_ok=True)
         return _download_single(
-            probe.resolved_url, final, probe.size, progress_cb, cancel, segment_cb, fwd
+            probe.resolved_url, final, probe.size, progress_cb, cancel, segment_cb, fwd,
+            session=session,
         )

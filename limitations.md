@@ -6,11 +6,13 @@ segments). Everything it can't handle traces back to that one boundary —
 no JavaScript execution, no cookie jar/login flow, no non-HTTP protocol,
 no streaming-media extractor. Concretely, it cannot download from:
 
-- **Google Drive share links (large files)** — Drive serves an HTML "can't
+- **Google Drive share links (large files, outside catch mode)** — Drive serves an HTML "can't
   scan this file for viruses" interstitial for anything past a size
   threshold, which requires extracting a `confirm=` token from a cookie or
-  the page body before the real file URL is reachable. TDM has no HTML
-  parsing or cookie jar, so it would just save the interstitial page.
+  the page body before the real file URL is reachable. When using the CLI
+  directly, TDM has no HTML parsing or cookie jar. However, in Catch mode,
+  clicking "Download anyway" in Chrome passes the direct download link and
+  session cookies through to TDM seamlessly.
 - **MediaFire and most consumer file lockers** — the real "Download now"
   link is generated client-side by JavaScript after the page loads (often
   behind a countdown timer); the initial HTML response TDM would fetch
